@@ -1,0 +1,462 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cat-Girl Run Cycle</title>
+<!--
+CHOICES MADE WHERE THE BRIEF WAS UNSPECIFIED
+ 1. {{HAIR_COLOR}} arrived as an unfilled template slot, so I picked lavender-violet #8f7cf0. Hair, ears and tail all read CONFIG.hair.
+ 2. Axes: +X forward, +Y up, the character's right side is +Z. The default camera therefore sees her front-right.
+ 3. Duty factor 40 %: each foot is planted 0.28 s of the 0.70 s cycle, giving two 0.07 s flight phases per cycle.
+ 4. Legs use analytic two-bone IK toward foot paths that are truncated Fourier series (integer harmonics of p), synthesised at
+    start-up from a contact / flight design curve. While planted the ankle moves backward at exactly GROUND_SPEED, and toe-off /
+    heel-strike pivot about the ball / heel, so the ground scrolls without foot slide.
+ 5. Ground stripe period = half the distance covered per cycle, so the scroll offset is exactly 2·p and the texture loops seamlessly.
+ 6. The face (eyes, brows, blush, mouth) is a CanvasTexture decal on a spherical patch. No blinking (it would break p-periodicity).
+ 7. Outlines are inverted hulls: a BackSide mesh pushed out along the normals in the vertex shader.
+ 8. Toon gradient steps are 0.35 / 0.70 / 1.0. Extra shades (darker hair / hoodie / pants) are derived from CONFIG colours in code.
+ 9. Camera damping is off so R restores the exact start pose. Polar angle is limited so the camera stays above the ground.
+10. Head/torso rotations are summed per axis and partly cancelled on the neck and head to get the stabilised head.
+-->
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #cfe8ff; }
+  canvas { display: block; }
+  #hud { position: fixed; left: 12px; top: 12px; padding: 8px 12px; font: 12px/1.55 ui-monospace, Consolas, monospace;
+         color: #1c2540; background: rgba(255,255,255,.74); border: 1px solid rgba(28,37,64,.25); border-radius: 8px;
+         pointer-events: none; user-select: none; }
+  #hud b { display: inline-block; min-width: 34px; }
+  #hud .st { margin-top: 4px; color: #3d5a9a; }
+</style>
+<script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"}}</script>
+</head>
+<body>
+<div id="hud">
+  <div><b>Space</b> pause / play</div>
+  <div><b>S</b> toggle 0.25× slow motion</div>
+  <div><b>0–9</b> pause, jump to p = 0.0 … 0.9</div>
+  <div><b>R</b> reset camera</div>
+  <div class="st" id="st"></div>
+</div>
+<script type="module">
+const CONFIG = {
+  cycleSeconds: 0.7,
+  background: '#cfe8ff', ground: '#9fd98b',
+  hair: '#8f7cf0', earInner: '#ffb3c6', iris: '#2ec4b6', highlight: '#ffffff', eyeWhite: '#ffffff',
+  skin: '#ffe0cc', blush: '#ff8fab', mouth: '#9c3a4a', tongue: '#ff8fa3', lash: '#1b1230',
+  hoodie: '#e8e8f0', pants: '#2b3a67', sneaker: '#ffffff', sole: '#e0443e',
+  outline: '#000000', skyLight: '#ffffff', groundLight: '#a9c99a', sun: '#fff6e8'
+};
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+const TAU = Math.PI * 2, clamp = THREE.MathUtils.clamp;
+const T = CONFIG.cycleSeconds;
+
+/* ================= run-cycle design ================= */
+const STANCE = 0.40, X_TOUCH = 0.27, X_LIFT = -0.27, SWING_H = 0.30;      // duty factor, ankle x at touch-down / lift-off, swing clearance
+const STRIDE = X_TOUCH - X_LIFT;                                          // ankle travel while planted
+const GROUND_SPEED = STRIDE / (STANCE * T);                               // units / s: planted foot's backward speed
+const THIGH = 0.38, SHIN = 0.38, ANKLE_H = 0.09, HIP_Y = 0.775, HIP_Z = 0.09;
+const BALL = [0.13, -0.09], HEEL = [-0.03, -0.09];                        // sole contact points in foot space (x fwd, y up)
+
+// Truncated Fourier synthesis: samples a design curve once, then evaluates only sin/cos(2π·k·u), k integer.
+function fourier(fn, K, N = 256) {
+  let a0 = 0; const a = [], b = [];
+  for (let i = 0; i < N; i++) a0 += fn(i / N) / N;
+  for (let k = 1; k <= K; k++) {
+    let c = 0, s = 0;
+    for (let i = 0; i < N; i++) { const v = fn(i / N); c += v * Math.cos(TAU * k * i / N); s += v * Math.sin(TAU * k * i / N); }
+    a.push(2 * c / N); b.push(2 * s / N);
+  }
+  return u => { let v = a0; for (let k = 1; k <= K; k++) v += a[k - 1] * Math.cos(TAU * k * u) + b[k - 1] * Math.sin(TAU * k * u); return v; };
+}
+const keyed = keys => u => {                                              // periodic cosine-eased key curve, keys[0][0] = 0, last = 1
+  u -= Math.floor(u);
+  for (let i = 0; i < keys.length - 1; i++) {
+    const [u0, v0] = keys[i], [u1, v1] = keys[i + 1];
+    if (u <= u1) return v0 + (v1 - v0) * (0.5 - 0.5 * Math.cos(Math.PI * (u - u0) / (u1 - u0)));
+  }
+  return keys[keys.length - 1][1];
+};
+const swingS = u => (u - STANCE) / (1 - STANCE);
+const idealX = u => {                                                     // linear backward while planted, C1 Hermite swing (paws back at touch-down)
+  u -= Math.floor(u);
+  if (u < STANCE) return X_TOUCH - STRIDE * u / STANCE;
+  const s = swingS(u), s2 = s * s, s3 = s2 * s, m = -STRIDE / STANCE * (1 - STANCE);
+  return (2 * s3 - 3 * s2 + 1) * X_LIFT + (s3 - 2 * s2 + s) * m + (-2 * s3 + 3 * s2) * X_TOUCH + (s3 - s2) * m;
+};
+const idealLift = u => { u -= Math.floor(u); return u < STANCE ? 0 : SWING_H * Math.sin(Math.PI * Math.pow(swingS(u), 0.75)) ** 2; };
+const fX = fourier(idealX, 14), fLift = fourier(idealLift, 14);
+const fPitch = fourier(keyed([[0, 0.18], [0.07, 0], [0.30, 0], [0.40, -0.5], [0.52, -0.75], [0.72, -0.2], [0.90, 0.10], [1, 0.18]]), 10);
+
+/* ================= renderer / scene ================= */
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(CONFIG.background);
+scene.fog = new THREE.Fog(CONFIG.background, 22, 55);
+
+const CAM_POS = new THREE.Vector3(4, 1.6, 5), CAM_TARGET = new THREE.Vector3(0, 0.9, 0);
+const camera = new THREE.PerspectiveCamera(35, innerWidth / innerHeight, 0.1, 120);
+camera.position.copy(CAM_POS);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.copy(CAM_TARGET);
+controls.enableDamping = false;
+controls.maxPolarAngle = Math.PI * 0.495;
+controls.update();
+controls.saveState();
+
+scene.add(new THREE.HemisphereLight(CONFIG.skyLight, CONFIG.groundLight, 1.45));
+const sun = new THREE.DirectionalLight(CONFIG.sun, 2.0);
+sun.position.set(2.2, 5, 3.2);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+Object.assign(sun.shadow.camera, { left: -2.5, right: 2.5, top: 2.5, bottom: -2.5, near: 1, far: 14 });
+sun.shadow.bias = -0.0004; sun.shadow.normalBias = 0.02; sun.shadow.radius = 4;
+scene.add(sun);
+
+/* ================= materials ================= */
+const gradient = new THREE.DataTexture(new Uint8Array([90, 178, 255]), 3, 1, THREE.RedFormat);   // 3-step toon ramp
+gradient.minFilter = gradient.magFilter = THREE.NearestFilter;
+gradient.needsUpdate = true;
+const shade = (hex, k) => new THREE.Color(hex).multiplyScalar(k);
+const toon = (c, o = {}) => new THREE.MeshToonMaterial({ color: c, gradientMap: gradient, ...o });
+const M = {
+  skin: toon(CONFIG.skin), hair: toon(CONFIG.hair), hairD: toon(shade(CONFIG.hair, 0.82)), earIn: toon(CONFIG.earInner),
+  hood: toon(CONFIG.hoodie), hoodD: toon(shade(CONFIG.hoodie, 0.8)), pants: toon(CONFIG.pants), pantsD: toon(shade(CONFIG.pants, 0.72)),
+  shoe: toon(CONFIG.sneaker), sole: toon(CONFIG.sole), white: toon('#ffffff')
+};
+
+const outlineMats = {};
+function outlineMat(t) {                                                   // one shader, per-material thickness uniform
+  return outlineMats[t] ||= Object.assign(new THREE.MeshBasicMaterial({ color: CONFIG.outline, side: THREE.BackSide }), {
+    onBeforeCompile(sh) {
+      sh.uniforms.uThick = { value: t };
+      sh.vertexShader = 'uniform float uThick;\n' + sh.vertexShader.replace('#include <begin_vertex>',
+        '#include <begin_vertex>\n transformed += normalize(normal) * uThick;');
+    }
+  });
+}
+function part(geo, mat, { t = 0.007, outline = true, shadow = true } = {}) {
+  const g = new THREE.Group(), m = new THREE.Mesh(geo, mat);
+  m.castShadow = shadow; m.receiveShadow = true; g.add(m);
+  if (outline) g.add(new THREE.Mesh(geo, outlineMat(t)));
+  return g;
+}
+function put(parent, geo, mat, x = 0, y = 0, z = 0, opt) {
+  const g = part(geo, mat, opt); g.position.set(x, y, z); parent.add(g); return g;
+}
+
+/* ================= geometry helpers ================= */
+const ellipsoid = (rx, ry, rz, w = 28, h = 18) => { const g = new THREE.SphereGeometry(1, w, h); g.scale(rx, ry, rz); return g; };
+const lathe = (pts, sx = 1, sz = 1, seg = 28) => { const g = new THREE.LatheGeometry(pts.map(([r, y]) => new THREE.Vector2(r, y)), seg); g.scale(sx, 1, sz); return g; };
+const torus = (R, r) => { const g = new THREE.TorusGeometry(R, r, 10, 28); g.rotateX(Math.PI / 2); return g; };
+function limb(len, r0, r1, seg = 20) {                                     // tapered capsule hanging from y = 0 (sphere r0) to y = -len (sphere r1)
+  const pts = [];
+  for (let i = 0; i <= 6; i++) { const a = -Math.PI / 2 + i * Math.PI / 12; pts.push([r1 * Math.cos(a), -len + r1 * Math.sin(a)]); }
+  for (let i = 0; i <= 6; i++) { const a = i * Math.PI / 12; pts.push([r0 * Math.cos(a), r0 * Math.sin(a)]); }
+  return lathe(pts, 1, 1, seg);
+}
+const cone = (w, d, h) => { const g = new THREE.ConeGeometry(1, 1, 20, 1); g.translate(0, 0.5, 0); g.scale(d, h, w); return g; };
+
+/* ---- head shape: skull radii, chin taper, analytic ellipsoid normals (no seam artefacts) ---- */
+const SK = [0.168, 0.185, 0.176];
+function shapeHead(g, k = 1) {
+  const p = g.attributes.position, n = g.attributes.normal, v = new THREE.Vector3();
+  for (let i = 0; i < p.count; i++) {
+    v.fromBufferAttribute(p, i);
+    const d = Math.max(0, -v.y), f = 1 - 0.30 * d * d;
+    n.setXYZ(i, v.x / SK[0], v.y / SK[1], v.z / SK[2]);
+    p.setXYZ(i, v.x * SK[0] * f * k, v.y * SK[1] * k, v.z * SK[2] * f * k);
+  }
+  const nv = new THREE.Vector3();
+  for (let i = 0; i < n.count; i++) { nv.fromBufferAttribute(n, i).normalize(); n.setXYZ(i, nv.x, nv.y, nv.z); }
+  return g;
+}
+function hairCapGeo() {                                                    // scalp cap with a low hairline at the back, high at the forehead
+  const g = new THREE.SphereGeometry(1, 48, 28, 0, TAU, 0, 2.15), p = g.attributes.position, n = g.attributes.normal, v = new THREE.Vector3(), k = 1.075;
+  for (let i = 0; i < p.count; i++) {
+    v.fromBufferAttribute(p, i);
+    const th = Math.acos(clamp(v.y, -1, 1)), az = Math.atan2(v.z, v.x);
+    const t2 = th * (2.15 - 1.05 * Math.pow(Math.max(0, Math.cos(az)), 1.3)) / 2.15;
+    const dx = Math.sin(t2) * Math.cos(az), dy = Math.cos(t2), dz = Math.sin(t2) * Math.sin(az);
+    p.setXYZ(i, dx * SK[0] * k, dy * SK[1] * k, dz * SK[2] * k);
+    v.set(dx / SK[0], dy / SK[1], dz / SK[2]).normalize(); n.setXYZ(i, v.x, v.y, v.z);
+  }
+  return g;
+}
+function strandGeo(len, w, flat = 0.55, taper = 0.78) {                    // hair clump hanging from y = 0; low taper → pointed tip, high → blunt cut
+  const wt = w * taper;
+  return lathe([[0, -len], [wt * 0.8, -len], [wt, -len + 0.007], [(wt + w) / 2, -len * 0.55], [w, -len * 0.2], [w * 0.7, -0.004], [0, 0.004]], flat, 1, 14);
+}
+
+/* ---- face decal (eyes, brows, blush, nose, mouth) ---- */
+const FACE = { ph: 0.95, t0: 1.12, tl: 1.2 };                              // half azimuth span, first polar angle, polar span (rad)
+function faceTexture() {
+  const W = 1024, H = 666, c = document.createElement('canvas'); c.width = W; c.height = H;
+  const g = c.getContext('2d');
+  const X = d => W / 2 + d * W / (2 * FACE.ph), Y = th => (th - FACE.t0) * H / FACE.tl;
+  const iris = new THREE.Color(CONFIG.iris), white = new THREE.Color('#ffffff');
+  const hairD = shade(CONFIG.hair, 0.55).getStyle();
+  g.lineCap = 'round'; g.lineJoin = 'round';
+  const eye = (cx, cy, s) => {
+    g.save(); g.translate(cx, cy); g.scale(s, 1);
+    g.beginPath(); g.ellipse(0, 0, 112, 136, 0, 0, TAU); g.fillStyle = CONFIG.eyeWhite; g.fill();
+    g.save(); g.clip();
+    const gr = g.createLinearGradient(0, -136, 0, 136);
+    gr.addColorStop(0, iris.clone().multiplyScalar(0.42).getStyle()); gr.addColorStop(0.55, iris.getStyle()); gr.addColorStop(1, iris.clone().lerp(white, 0.6).getStyle());
+    g.fillStyle = gr; g.beginPath(); g.ellipse(6, 10, 98, 130, 0, 0, TAU); g.fill();
+    g.fillStyle = '#10262e'; g.beginPath(); g.ellipse(6, 14, 44, 70, 0, 0, TAU); g.fill();
+    g.fillStyle = 'rgba(255,255,255,0.22)'; g.beginPath(); g.ellipse(6, 76, 70, 38, 0, 0, TAU); g.fill();
+    g.fillStyle = CONFIG.highlight;
+    g.beginPath(); g.ellipse(-34, -46, 30, 36, -0.3, 0, TAU); g.fill();
+    g.beginPath(); g.arc(46, 58, 14, 0, TAU); g.fill();
+    g.beginPath(); g.arc(-8, 84, 8, 0, TAU); g.fill();
+    g.restore();
+    g.strokeStyle = CONFIG.lash; g.lineWidth = 24;
+    g.beginPath(); g.ellipse(0, 0, 116, 140, 0, Math.PI * 1.03, Math.PI * 1.98); g.stroke();
+    g.lineWidth = 16; g.beginPath(); g.moveTo(112, -12); g.quadraticCurveTo(150, -24, 172, -66); g.stroke();
+    g.lineWidth = 6; g.globalAlpha = 0.55; g.beginPath(); g.ellipse(0, 0, 112, 136, 0, Math.PI * 0.12, Math.PI * 0.88); g.stroke(); g.globalAlpha = 1;
+    g.restore();
+  };
+  const brow = (cx, cy, s) => { g.strokeStyle = hairD; g.lineWidth = 15; g.beginPath(); g.moveTo(cx - 70 * s, cy + 8); g.quadraticCurveTo(cx, cy - 22, cx + 72 * s, cy - 4); g.stroke(); };
+  const blush = (cx, cy) => {
+    const rg = g.createRadialGradient(cx, cy, 4, cx, cy, 78);
+    rg.addColorStop(0, CONFIG.blush + 'cc'); rg.addColorStop(1, CONFIG.blush + '00');
+    g.fillStyle = rg; g.beginPath(); g.ellipse(cx, cy, 78, 40, 0, 0, TAU); g.fill();
+    g.strokeStyle = shade(CONFIG.blush, 0.85).getStyle(); g.lineWidth = 8;
+    for (let i = -1; i <= 1; i++) { g.beginPath(); g.moveTo(cx + i * 28 - 10, cy + 12); g.lineTo(cx + i * 28 + 10, cy - 12); g.stroke(); }
+  };
+  eye(X(-0.40), Y(1.72), -1); eye(X(0.40), Y(1.72), 1);
+  brow(X(-0.40), Y(1.72) - 205, -1); brow(X(0.40), Y(1.72) - 205, 1);
+  blush(X(-0.52), Y(1.93)); blush(X(0.52), Y(1.93));
+  g.strokeStyle = '#e9a58f'; g.lineWidth = 6; g.beginPath(); g.arc(X(0), Y(1.93) - 10, 9, 0.2 * Math.PI, 0.8 * Math.PI); g.stroke();
+  g.save(); g.translate(X(0), Y(2.06));                                    // small open mouth with tongue
+  g.beginPath(); g.moveTo(-32, 0); g.quadraticCurveTo(0, 8, 32, 0); g.quadraticCurveTo(28, 34, 0, 34); g.quadraticCurveTo(-28, 34, -32, 0); g.closePath();
+  g.fillStyle = CONFIG.mouth; g.fill();
+  g.save(); g.clip(); g.fillStyle = CONFIG.tongue; g.beginPath(); g.ellipse(0, 36, 17, 13, 0, 0, TAU); g.fill(); g.restore();
+  g.strokeStyle = CONFIG.lash; g.lineWidth = 6; g.stroke();
+  g.restore();
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace; tex.anisotropy = 8;
+  return tex;
+}
+
+/* ================= ground (scrolling procedural stripes) ================= */
+const STRIPE_W = GROUND_SPEED * T / 2;                                     // one light+dark pair; the ground moves exactly 2 pairs per cycle
+const groundTex = (() => {
+  const c = document.createElement('canvas'); c.width = c.height = 512;
+  const g = c.getContext('2d');
+  g.fillStyle = CONFIG.ground; g.fillRect(0, 0, 512, 512);
+  g.fillStyle = 'rgba(0,70,30,0.10)'; g.fillRect(256, 0, 256, 512);        // alternating stripe
+  g.fillStyle = 'rgba(255,255,255,0.38)'; g.fillRect(0, 0, 10, 512); g.fillRect(0, 0, 512, 6);   // cross line + lane line
+  const t = new THREE.CanvasTexture(c);
+  t.wrapS = t.wrapT = THREE.RepeatWrapping; t.colorSpace = THREE.SRGBColorSpace;
+  t.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  t.repeat.set(100, 34);
+  return t;
+})();
+const ground = new THREE.Mesh(new THREE.PlaneGeometry(STRIPE_W * 100, STRIPE_W * 3 * 34), toon('#ffffff', { map: groundTex }));
+ground.rotation.x = -Math.PI / 2; ground.receiveShadow = true;
+scene.add(ground);
+
+/* ================= rig: pelvis → spine → chest → neck → head, arms, legs ================= */
+const root = new THREE.Group(); scene.add(root);
+const joint = (parent, x, y, z, order = 'XYZ') => { const g = new THREE.Group(); g.position.set(x, y, z); g.rotation.order = order; parent.add(g); return g; };
+const pelvis = joint(root, 0, HIP_Y, 0, 'YXZ');
+const spine = joint(pelvis, 0, 0.06, 0, 'YXZ');
+const chest = joint(spine, 0, 0.10, 0, 'YXZ');
+const neck = joint(chest, 0, 0.13, 0, 'YXZ');
+const head = joint(neck, 0, 0.05, 0, 'YXZ');
+const headC = joint(head, 0, 0.16, 0);                                     // skull centre
+
+/* ---- torso: navy hips, oversized hoodie, hood, collar, drawstrings ---- */
+put(pelvis, ellipsoid(0.115, 0.10, 0.155), M.pants, 0, -0.02, 0);
+put(spine, lathe([[0, -0.135], [0.10, -0.135], [0.15, -0.128], [0.168, -0.10], [0.172, -0.03], [0.165, 0.06], [0.15, 0.12], [0, 0.14]], 0.86, 1.1), M.hood);
+put(chest, lathe([[0, -0.11], [0.12, -0.108], [0.155, -0.07], [0.168, 0], [0.165, 0.06], [0.14, 0.11], [0.10, 0.14], [0.075, 0.155], [0, 0.16]], 0.9, 1.12), M.hood);
+put(chest, torus(0.07, 0.024), M.hoodD, 0, 0.145, 0);
+put(chest, ellipsoid(0.07, 0.065, 0.105), M.hoodD, -0.07, 0.15, 0);
+for (const s of [-1, 1]) put(chest, limb(0.09, 0.008, 0.008, 8), M.white, 0.137, 0.105, s * 0.035, { t: 0.003 }).rotation.z = 0.05;
+put(neck, ellipsoid(0.046, 0.06, 0.046), M.skin, 0, 0.02, 0);
+
+/* ---- head: skull, face decal, hair, ears ---- */
+put(headC, shapeHead(new THREE.SphereGeometry(1, 40, 28)), M.skin, 0, 0, 0, { t: 0.006 });
+const faceMesh = new THREE.Mesh(
+  shapeHead(new THREE.SphereGeometry(1, 40, 24, Math.PI - FACE.ph, 2 * FACE.ph, FACE.t0, FACE.tl), 1.008),
+  new THREE.MeshBasicMaterial({ map: faceTexture(), transparent: true, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -4, polygonOffsetUnits: -4 }));
+headC.add(faceMesh);
+put(headC, hairCapGeo(), M.hair, 0, 0, 0, { t: 0.006 });
+
+// Hair clumps: root (yaw so local +X points away from the head) → swing joint(s) hanging down local −Y.
+function clumpRoot(theta, az, k = 1.03) {
+  const r = joint(headC, SK[0] * k * Math.sin(theta) * Math.cos(az), SK[1] * k * Math.cos(theta), SK[2] * k * Math.sin(theta) * Math.sin(az));
+  r.rotation.y = -az; return r;
+}
+function clump(theta, az, len, w, mat, base) {
+  const sw = joint(clumpRoot(theta, az), 0, 0, 0); sw.rotation.z = base;
+  put(sw, strandGeo(len, w), mat, 0, 0, 0, { t: 0.0055 });
+  return sw;
+}
+const bangs = [], sides = [], backs = [];
+for (let i = -3; i <= 3; i++) bangs.push(clump(0.95, i * 0.30, 0.078 + 0.012 * Math.cos(i * 0.6), 0.034, M.hair, 0.30));      // blunt bangs
+for (const s of [-1, 1]) sides.push({ sw: clump(1.25, s * 1.30, 0.17, 0.028, M.hair, 0.12) });                               // face-framing locks
+for (let i = 0; i < 7; i++) {                                                                                                // shoulder-length back clumps (2 segments each)
+  const az = Math.PI + (i - 3) * 0.5, up = clump(1.3, az, 0.13, 0.046, i % 2 ? M.hairD : M.hair, 0.1);
+  const lo = joint(up, 0, -0.125, 0);
+  put(lo, strandGeo(0.14, 0.04, 0.55, 0.22), i % 2 ? M.hairD : M.hair, 0, 0, 0, { t: 0.0055 });
+  backs.push({ up, lo, az });
+}
+function makeEar(s) {
+  const ear = joint(headC, -0.008, 0.148, s * 0.104);
+  put(ear, cone(0.075, 0.046, 0.15), M.hair, 0, -0.01, 0, { t: 0.006 });
+  put(ear, cone(0.047, 0.05, 0.108), M.earIn, 0.016, 0.005, 0, { t: 0.003 });
+  return ear;
+}
+const ears = { R: makeEar(1), L: makeEar(-1) };
+
+/* ---- arms: chest → shoulder → upper arm → forearm → hand ---- */
+function makeArm(s) {
+  const shoulder = joint(chest, 0, 0.115, s * 0.06);
+  const upper = joint(shoulder, 0, -0.015, s * 0.12);
+  const fore = joint(upper, 0, -0.26, 0);
+  const hand = joint(fore, 0, -0.24, 0);
+  put(upper, limb(0.26, 0.066, 0.058), M.hood);
+  put(fore, limb(0.24, 0.058, 0.05), M.hood);
+  put(fore, torus(0.052, 0.012), M.hoodD, 0, -0.235, 0);
+  put(hand, ellipsoid(0.04, 0.05, 0.037), M.skin, 0.004, -0.05, 0, { t: 0.005 });
+  return { shoulder, upper, fore, hand };
+}
+const arms = { R: makeArm(1), L: makeArm(-1) };
+
+/* ---- legs: pelvis → thigh → shin → foot, navy track pants, white sneakers with red soles ---- */
+function makeLeg(s) {
+  const thigh = joint(pelvis, 0, -0.005, s * HIP_Z);
+  const shin = joint(thigh, 0, -THIGH, 0);
+  const foot = joint(shin, 0, -SHIN, 0);
+  put(thigh, limb(THIGH, 0.072, 0.058), M.pants);
+  put(shin, limb(SHIN, 0.057, 0.044), M.pants);
+  put(shin, torus(0.05, 0.012), M.pantsD, 0, -0.325, 0);
+  const sole = new THREE.CapsuleGeometry(0.03, 0.17, 6, 16); sole.rotateZ(Math.PI / 2); sole.scale(1, 0.62, 1.5);
+  put(foot, sole, M.sole, 0.05, -0.0714, 0, { t: 0.006 });
+  put(foot, ellipsoid(0.105, 0.046, 0.05), M.shoe, 0.035, -0.036, 0);
+  put(foot, ellipsoid(0.05, 0.036, 0.048), M.shoe, 0.115, -0.05, 0);
+  put(foot, torus(0.043, 0.011), M.white, 0, -0.004, 0, { t: 0.004 });
+  return { thigh, shin, foot };
+}
+const legs = { R: makeLeg(1), L: makeLeg(-1) };
+
+/* ---- tail: 12 chained tapered segments from the lower back ---- */
+const TAIL_N = 12, TAIL_LEN = 0.062, TAIL_BASE = 1.35, TAIL_CURL = -0.10;
+const tail = [];
+for (let i = 0; i < TAIL_N; i++) {
+  const j = i ? joint(tail[i - 1], 0, TAIL_LEN, 0) : joint(pelvis, -0.10, -0.04, 0);
+  const g = limb(TAIL_LEN, 0.042 - 0.024 * i / (TAIL_N - 1), 0.042 - 0.024 * (i + 1) / (TAIL_N - 1), 14); g.rotateX(Math.PI);
+  put(j, g, M.hair, 0, 0, 0, { t: 0.006 });
+  tail.push(j);
+}
+
+/* ================= animation: everything below is a function of the single phase p ================= */
+const _t = new THREE.Vector3();
+// Foot path → world-space ankle target (x fwd, planted foot moves at −GROUND_SPEED) → two-bone IK in pelvis space (thigh = shin length).
+function legIK(leg, u, s) {
+  const psi = fPitch(u), [px, py] = psi < 0 ? BALL : HEEL, c = Math.cos(psi), sn = Math.sin(psi);
+  _t.set(fX(u) + px - (px * c - py * sn),                                   // rotating about the heel / ball keeps that contact point planted
+         ANKLE_H + Math.max(0, fLift(u)) + py - (px * sn + py * c), s * 0.095);
+  pelvis.worldToLocal(_t);
+  const hip = leg.thigh.position, dx = _t.x - hip.x, dy = _t.y - hip.y;
+  const L = clamp(Math.hypot(dx, dy), 0.15, (THIGH + SHIN) * 0.998);
+  const phi = Math.atan2(dx, -dy), al = Math.acos(clamp(L / (2 * THIGH), -1, 1));
+  leg.thigh.rotation.z = phi + al;                                          // hip flexion (+ = thigh forward)
+  leg.shin.rotation.z = -2 * al;                                            // knee flexion (shin swings back)
+  leg.foot.rotation.z = psi - pelvis.rotation.z - (phi - al);               // ankle: keeps the foot at the designed pitch
+}
+
+function pose(p) {
+  const ph = (n, o = 0) => TAU * n * (p - o);
+  const bob = -Math.cos(ph(2, 0.12));                                       // −1 just after each contact, +1 in flight (twice per cycle)
+  const yaw = Math.cos(ph(1, -0.03)), roll = Math.sin(ph(1, -0.05));
+
+  // pelvis & torso: bob, yaw, roll, counter-rotating chest, forward lean
+  pelvis.position.set(-0.012 * Math.cos(ph(2, 0.05)), HIP_Y + 0.03 * bob, 0);
+  pelvis.rotation.set(-0.055 * roll, 0.12 * yaw, -0.05 + 0.015 * bob);
+  spine.rotation.set(0.03 * roll, -0.13 * yaw, -0.06);
+  chest.rotation.set(0.02 * roll, -0.13 * yaw, -0.06 + 0.02 * bob);
+
+  // head: cancels ~90 % of torso rotation, half the bob, small nod
+  const tx = pelvis.rotation.x + spine.rotation.x + chest.rotation.x;
+  const ty = pelvis.rotation.y + spine.rotation.y + chest.rotation.y;
+  const tz = pelvis.rotation.z + spine.rotation.z + chest.rotation.z;
+  neck.position.y = 0.13 - 0.016 * bob;
+  neck.rotation.set(-0.5 * tx, -0.5 * ty, -0.5 * tz);
+  head.rotation.set(-0.4 * tx, -0.4 * ty, -0.4 * tz + 0.045 * Math.sin(ph(2, 0.02)));
+
+  // legs (IK): right foot touches down at p = 0, left at p = 0.5
+  pelvis.updateMatrixWorld(true);
+  legIK(legs.R, p, 1); legIK(legs.L, p + 0.5, -1);
+
+  // arms: swing opposite to the legs, elbows ≈ 90°
+  const cyc = Math.cos(ph(1, 0.02));
+  for (const [key, s] of [['R', 1], ['L', -1]]) {
+    const a = arms[key];
+    a.upper.rotation.set(-s * 0.13, 0, -s * 0.68 * cyc);
+    a.fore.rotation.z = 1.55 - s * 0.28 * cyc + 0.05 * Math.cos(ph(2, 0.02));
+    a.hand.rotation.z = -0.12;
+    a.shoulder.rotation.set(0, s * 0.08 * cyc, 0.03 * bob);
+  }
+
+  // ears: delayed bounce
+  for (const [key, s] of [['R', 1], ['L', -1]]) ears[key].rotation.set(s * (0.32 + 0.05 * Math.sin(ph(2, 0.16))), 0, 0.10 - 0.11 * Math.cos(ph(2, 0.22)));
+
+  // hair: back clumps lag the head (delay and amplitude grow toward the tips)
+  for (const b of bangs) b.rotation.z = 0.30 - 0.035 * Math.cos(ph(2, 0.15));
+  for (const s of sides) s.sw.rotation.z = 0.12 - 0.05 * Math.cos(ph(2, 0.19));
+  for (const b of backs) {
+    const sway = -Math.cos(b.az);
+    b.up.rotation.set(sway * 0.05 * Math.sin(ph(1, 0.18)), 0, 0.10 - 0.10 * Math.cos(ph(2, 0.20)));
+    b.lo.rotation.set(sway * 0.11 * Math.sin(ph(1, 0.28)), 0, 0.12 - 0.18 * Math.cos(ph(2, 0.28)));
+  }
+
+  // tail: travelling wave, phase delay and amplitude increase toward the tip
+  tail.forEach((j, i) => {
+    const f = i / (TAIL_N - 1), d = 0.03 + 0.17 * f, a = 0.012 + 0.075 * f * f;
+    j.rotation.z = (i ? TAIL_CURL : TAIL_BASE) - a * Math.cos(ph(2, 0.12 + d));
+    j.rotation.x = (0.02 + 0.10 * f) * Math.sin(ph(1, 0.10 + 0.25 * f));
+  });
+
+  groundTex.offset.x = 2 * p;                                               // ground scrolls toward −X, exactly V·T = 2 stripe pairs per cycle
+}
+
+/* ================= main loop, controls ================= */
+let phase = 0, paused = false, slow = false, last = performance.now();
+const statusEl = document.getElementById('st');
+function resetCamera() { controls.reset(); camera.position.copy(CAM_POS); controls.target.copy(CAM_TARGET); controls.update(); }
+addEventListener('keydown', e => {
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
+  const k = e.key;
+  if (k === ' ') { e.preventDefault(); if (!e.repeat) paused = !paused; }
+  else if (k === 's' || k === 'S') slow = !slow;
+  else if (/^[0-9]$/.test(k)) { paused = true; phase = Number(k) / 10; }
+  else if (k === 'r' || k === 'R') resetCamera();
+});
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.setSize(innerWidth, innerHeight);
+});
+renderer.setAnimationLoop(now => {
+  const dt = Math.min((now - last) / 1000, 0.1); last = now;
+  if (!paused) phase = (phase + dt * (slow ? 0.25 : 1) / T) % 1;
+  pose(phase);
+  statusEl.textContent = `${paused ? 'paused' : 'running'} · ${slow ? '0.25×' : '1×'} · p = ${phase.toFixed(3)}`;
+  controls.update();
+  renderer.render(scene, camera);
+});
+</script>
+</body>
+</html>
