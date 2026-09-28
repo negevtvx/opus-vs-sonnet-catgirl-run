@@ -20,21 +20,16 @@ Or open them one at a time: [Opus 5.5](https://negevtvx.github.io/opus-vs-sonnet
 
 ---
 
-## Time and tokens
+## Time
 
-The big one isn't how they look. It's how much time and how many tokens each one burned.
+The big one isn't how they look. It's how long each one took.
 
 | | Claude Opus 5.5 | Claude Sonnet 5.5 |
 |---|---|---|
 | API time | 28m 33s | 45m 46s |
 | Active time | 6m 47s | 45m 58s |
-| Input tokens | 78 | 48 |
-| Output tokens | 183.2k | 1.1k |
-| Cache read | 8.2M | 4M |
-| Cache write | 271.7k | 175.8k |
-| Cache hit rate | 97% | 96% |
 
-These numbers come straight from the Claude app's session panel for each run. Sonnet's session also used the built-in browser tool.
+These times come straight from the Claude app's session panel for each run.
 
 ## "You cherry-picked." No I didn't. Receipts:
 
